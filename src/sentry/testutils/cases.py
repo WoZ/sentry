@@ -500,7 +500,7 @@ class IntegrationTestCase(TestCase):
     provider = None
 
     def setUp(self):
-        from sentry.integrations.helper import PipelineHelper
+        from sentry.integrations.helper import IntegrationPipelineHelper
 
         super(IntegrationTestCase, self).setUp()
 
@@ -509,7 +509,7 @@ class IntegrationTestCase(TestCase):
         self.path = '/extensions/{}/setup/'.format(self.provider.id)
         self.request = self.make_request(self.user)
         # XXX(dcramer): this is a bit of a hack, but it helps contain this test
-        self.helper = PipelineHelper.initialize(
+        self.helper = IntegrationPipelineHelper.initialize(
             request=self.request,
             organization=self.organization,
             provider_id=self.provider.id,

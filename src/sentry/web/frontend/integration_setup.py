@@ -3,7 +3,7 @@ from __future__ import absolute_import, print_function
 import logging
 
 from sentry import features
-from sentry.integrations.helper import PipelineHelper
+from sentry.integrations.helper import IntegrationPipelineHelper
 from sentry.web.frontend.base import BaseView
 
 logger = logging.getLogger('sentry.integrations')
@@ -20,7 +20,7 @@ class IntegrationSetupView(BaseView):
         )
 
     def handle(self, request, provider_id):
-        helper = PipelineHelper.get_for_request(
+        helper = IntegrationPipelineHelper.get_for_request(
             request=request,
             provider_id=provider_id,
         )

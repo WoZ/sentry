@@ -20,6 +20,7 @@ from sentry.models import (
 )
 from sentry.tasks.auth import email_missing_links
 from sentry.utils import auth
+from sentry.utils.auth_pipeline import PipelineHelper
 from sentry.utils.hashlib import md5_text
 from sentry.utils.http import absolute_uri
 from sentry.utils.retries import TimedRetryPolicy
@@ -41,7 +42,7 @@ ERR_NOT_AUTHED = _('You must be authenticated to link accounts.')
 ERR_INVALID_IDENTITY = _('The provider did not return a valid user identity.')
 
 
-class AuthHelper(object):
+class AuthHelper(PipelineHelper):
     """
     Helper class which is passed into AuthView's.
 
@@ -61,64 +62,55 @@ class AuthHelper(object):
     6. The user is authenticated and creating a new identity, but not linking
        it with their account (thus creating a new account).
     """
+    logger = logging.getLogger('sentry.auth')
+
+    logger_event_prefix = 'auth'
+
+    session_key = 'auth'
+
     # logging in or registering
     FLOW_LOGIN = 1
     # configuring the provider
     FLOW_SETUP_PROVIDER = 2
 
     @classmethod
-    def get_for_request(cls, request):
-        session = request.session.get('auth', {})
-        organization_id = session.get('org')
-        if not organization_id:
-            logging.info('Invalid SSO data found')
-            return None
-
-        flow = session['flow']
-
-        auth_provider_id = session.get('ap')
-        provider_key = session.get('p')
-        if auth_provider_id:
-            auth_provider = AuthProvider.objects.get(id=auth_provider_id)
-        elif provider_key:
-            auth_provider = None
+    def params_from_session(cls, request, session, provider_id):
+        # TODO(dcramer): enforce access check
+        params = super(AuthHelper, cls).params_from_session(
+            request, session, provider_id)
 
         organization = Organization.objects.get(
             id=session['org'],
         )
 
-        return cls(
-            request, organization, flow, auth_provider=auth_provider, provider_key=provider_key
-        )
+        auth_provider_id = session.get('ap')
+        if auth_provider_id:
+            auth_provider = AuthProvider.objects.get(id=auth_provider_id)
+            provider_id = auth_provider.provider
+        else:
+            auth_provider = None
+            provider_id = provider_id
 
-    def __init__(self, request, organization, flow, auth_provider=None, provider_key=None):
-        assert provider_key or auth_provider
+        params.update({
+            'flow': session['flow'],
+            'auth_provider': auth_provider,
+            'organization': organization,
+            'provider_id': provider_id,
+        })
+        return params
 
-        self.request = request
-        self.auth_provider = auth_provider
-        self.organization = organization
-        self.flow = flow
+    def get_provider(self, provider_id):
+        return manager.get(provider_id)
 
-        if auth_provider:
-            provider = auth_provider.get_provider()
-        elif provider_key:
-            provider = manager.get(provider_key)
+    def get_pipeline(self):
+        if self.flow == self.FLOW_LOGIN:
+            return self.provider.get_auth_pipeline()
+        elif self.flow == self.FLOW_SETUP_PROVIDER:
+            return self.provider.get_setup_pipeline()
         else:
             raise NotImplementedError
 
-        self.provider = provider
-        if flow == self.FLOW_LOGIN:
-            self.pipeline = provider.get_auth_pipeline()
-        elif flow == self.FLOW_SETUP_PROVIDER:
-            self.pipeline = provider.get_setup_pipeline()
-        else:
-            raise NotImplementedError
-
-        # we serialize the pipeline to be [AuthView().get_ident(), ...] which
-        # allows us to determine if the pipeline has changed during the auth
-        # flow or if the user is somehow circumventing a chunk of it
-        self.signature = md5_text(' '.join(av.get_ident() for av in self.pipeline)).hexdigest()
-
+    # TODO(dcramer): can we refactor out the use of this mechanism?
     def pipeline_is_valid(self):
         session = self.request.session.get('auth', {})
         if not session:
@@ -127,62 +119,30 @@ class AuthHelper(object):
             return False
         return session.get('sig') == self.signature
 
-    def init_pipeline(self):
-        session = {
-            'uid': self.request.user.id if self.request.user.is_authenticated() else None,
-            'ap': self.auth_provider.id if self.auth_provider else None,
-            'p': self.provider.key,
+    def get_session_state(self):
+        result = super(AuthHelper, self).get_session_state()
+        result.update({
             'org': self.organization.id,
-            'idx': 0,
-            'sig': self.signature,
+            'ap': self.auth_provider.id if self.auth_provider else None,
             'flow': self.flow,
-            'state': {},
-        }
-        self.request.session['auth'] = session
-        self.request.session.modified = True
+        })
+        return result
 
     def get_redirect_url(self):
         return absolute_uri(reverse('sentry-auth-sso'))
 
-    def clear_session(self):
-        if 'auth' in self.request.session:
-            del self.request.session['auth']
-            self.request.session.modified = True
-
-    def current_step(self):
-        """
-        Render the current step.
-        """
-        session = self.request.session['auth']
-        idx = session['idx']
-        if idx == len(self.pipeline):
-            return self.finish_pipeline()
-        return self.pipeline[idx].dispatch(
-            request=self.request,
-            helper=self,
-        )
-
-    def next_step(self):
-        """
-        Render the next step.
-        """
-        self.request.session['auth']['idx'] += 1
-        self.request.session.modified = True
-        return self.current_step()
-
     def finish_pipeline(self):
-        session = self.request.session['auth']
-        state = session['state']
+        state = self.state
 
         try:
             identity = self.provider.build_identity(state)
         except IdentityNotValid:
             return self.error(ERR_INVALID_IDENTITY)
 
-        if session['flow'] == self.FLOW_LOGIN:
+        if self.flow == self.FLOW_LOGIN:
             # create identity and authenticate the user
             response = self._finish_login_pipeline(identity)
-        elif session['flow'] == self.FLOW_SETUP_PROVIDER:
+        elif self.flow == self.FLOW_SETUP_PROVIDER:
             response = self._finish_setup_pipeline(identity)
 
         return response

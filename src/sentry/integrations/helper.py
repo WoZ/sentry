@@ -1,53 +1,35 @@
 from __future__ import absolute_import, print_function
 
-__all__ = ['PipelineHelper']
+__all__ = ['IntegrationPipelineHelper']
 
-import json
 import logging
 
 from django.db import IntegrityError, transaction
-from django.http import HttpResponse
 
 from sentry.api.serializers import serialize
 from sentry.models import (
     Identity, IdentityProvider, IdentityStatus, Integration, Organization,
     UserIdentity
 )
-from sentry.utils.hashlib import md5_text
+from sentry.utils.auth_pipeline import PipelineHelper
 from sentry.utils.http import absolute_uri
-from sentry.web.helpers import render_to_response
 
 from . import default_manager
 
-SESSION_KEY = 'integration.setup'
 
-DIALOG_RESPONSE = """
-<!doctype html>
-<html>
-<body>
-<script>
-window.opener.postMessage({json}, document.origin);
-window.close();
-</script>
-<noscript>Please wait...</noscript>
-</body>
-</html>
-"""
+class IntegrationPipelineHelper(PipelineHelper):
+    logger = logging.getLogger('sentry.integrations')
 
-logger = logging.getLogger('sentry.integrations')
+    logger_event_prefix = 'integrations'
 
-
-class PipelineHelper(object):
-    logger = logger
+    session_key = 'integration.setup'
 
     @classmethod
-    def get_for_request(cls, request, provider_id):
-        session = request.session.get(SESSION_KEY, {})
-        if not session:
-            logger.error('integrations.setup.missing-session-data')
-            return None
-
+    def params_from_session(cls, request, session, provider_id):
         # TODO(dcramer): enforce access check
+        params = super(IntegrationPipelineHelper, cls).params_from_session(
+            request, session, provider_id)
+
         organization = Organization.objects.get(
             id=session['org'],
         )
@@ -60,127 +42,41 @@ class PipelineHelper(object):
         else:
             integration = None
 
-        if provider_id != session['pro']:
-            logger.error('integrations.setup.invalid-provider')
-            return None
+        params.update({
+            'integration': integration,
+            'organization': organization,
+        })
+        return params
 
-        if session['uid'] != request.user.id:
-            logger.error('integrations.setup.invalid-uid')
-            return None
-
-        instance = cls(
-            request=request,
-            organization=organization,
-            integration=integration,
-            provider_id=provider_id,
-            step=session['step'],
-            dialog=bool(session['dlg']),
-            state=session['state'],
-        )
-        if instance.signature != session['sig']:
-            logger.error('integrations.setup.invalid-signature')
-            return None
-        return instance
-
-    @classmethod
-    def initialize(cls, request, organization, provider_id, dialog=False):
-        inst = cls(
-            request=request,
-            organization=organization,
-            provider_id=provider_id,
-            dialog=dialog,
-        )
-        inst.save_session()
-        return inst
-
-    def __init__(self, request, organization, provider_id, integration=None,
-                 step=0, state=None, dialog=False):
-        self.request = request
-        self.integration = integration
+    def __init__(self, organization, integration=None, **kwargs):
+        super(IntegrationPipelineHelper, self).__init__(**kwargs)
         self.organization = organization
-        self.provider = default_manager.get(provider_id)
-        self.pipeline = self.provider.get_pipeline()
-        self.signature = md5_text(*[
-            '{module}.{name}'.format(
-                module=type(v).__module__,
-                name=type(v).__name__,
-            ) for v in self.pipeline
-        ]).hexdigest()
-        self.step = step
-        self.state = state or {}
-        self.dialog = dialog
+        self.integration = integration
 
-    def save_session(self):
-        self.request.session[SESSION_KEY] = {
-            'uid': self.request.user.id,
-            'org': self.organization.id,
-            'pro': self.provider.id,
-            'int': self.integration.id if self.integration else '',
-            'sig': self.signature,
-            'step': self.step,
-            'state': self.state,
-            'dlg': int(self.dialog),
-        }
-        self.request.session.modified = True
+    def get_default_context(self):
+        context = super(IntegrationPipelineHelper, self).get_default_context()
+        context['organization'] = self.organization
+        return context
 
     def get_redirect_url(self):
         return absolute_uri('/extensions/{}/setup/'.format(
             self.provider.id,
         ))
 
-    def clear_session(self):
-        if SESSION_KEY in self.request.session:
-            del self.request.session[SESSION_KEY]
-            self.request.session.modified = True
+    def get_provider(self, provider_id):
+        return default_manager.get(provider_id)
 
-    def current_step(self):
-        """
-        Render the current step.
-        """
-        if self.step == len(self.pipeline):
-            return self.finish_pipeline()
-        return self.pipeline[self.step].dispatch(
-            request=self.request,
-            helper=self,
-        )
-
-    def next_step(self):
-        """
-        Render the next step.
-        """
-        self.step += 1
-        self.save_session()
-        return self.current_step()
+    def get_session_state(self):
+        result = super(IntegrationPipelineHelper, self).get_session_state()
+        result.update({
+            'org': self.organization.id,
+            'int': self.integration.id if self.integration else '',
+        })
+        return result
 
     def finish_pipeline(self):
         data = self.provider.build_integration(self.state)
-        response = self._finish_pipeline(data)
-        self.clear_session()
-        return response
 
-    def respond(self, template, context=None, status=200):
-        default_context = {
-            'organization': self.organization,
-            'provider': self.provider,
-        }
-        if context:
-            default_context.update(context)
-
-        return render_to_response(template, default_context, self.request, status=status)
-
-    def error(self, message):
-        # TODO(dcramer): this needs to handle the dialog
-        self.clear_session()
-        return self._dialog_response({'detail': message}, False)
-
-    def bind_state(self, key, value):
-        self.state[key] = value
-        self.save_session()
-
-    def fetch_state(self, key):
-        return self.state.get(key)
-
-    def _finish_pipeline(self, data):
         if self.integration:
             assert data['external_id'] == self.integration.external_id
             self.integration.update(
@@ -225,16 +121,11 @@ class PipelineHelper(object):
             except IntegrityError:
                 pass
 
-        return self._dialog_response(serialize(self.integration, self.request.user), True)
+        self.clear_session()
 
-    def _dialog_response(self, data, success):
-        assert self.dialog
-        return HttpResponse(
-            DIALOG_RESPONSE.format(
-                json=json.dumps({
-                    'success': success,
-                    'data': data,
-                })
-            ),
-            content_type='text/html',
-        )
+        if self.dialog:
+            return self.dialog_response(
+                serialize(self.integration, self.request.user),
+                True,
+            )
+        return self.standard_response(True)
